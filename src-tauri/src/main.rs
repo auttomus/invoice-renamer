@@ -96,12 +96,82 @@ fn strip_prefix_underscore(name: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
+/// Pembersihan karakter ilegal filesystem Windows (< > : " / \ | ? *)
+fn sanitize_filename_part(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '<' | '>' | '|' => '-',
+            '"' => '\'', // konversi double quote menjadi single quote yang valid
+            _ => c,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Transformasi Format Coretax (5 blok dipisahkan " - "):
+/// Input : [Periode] - [NSFP] - [Nama Penjual] - [Nama Toko] - [No Faktur].pdf
+/// Output: [Nama Toko] - [No Faktur] - [Periode] - [Nama Penjual] - [NSFP].pdf
+fn transform_coretax_5parts(name: &str) -> Option<String> {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, ""),
+    };
+
+    // Delimiter harus " - " (spasi-strip-spasi)
+    let parts: Vec<&str> = stem.split(" - ").collect();
+    if parts.len() != 5 {
+        return None;
+    }
+
+    let period = parts[0].trim();
+    let nsfp = parts[1].trim();
+    let seller = parts[2].trim();
+    let buyer = parts[3].trim();
+    let invoice_no = parts[4].trim();
+
+    // Validasi pola periode: YYYY-MM (panjang 7, format tahun 4 digit - bulan 2 digit)
+    if period.len() != 7 || period.chars().nth(4) != Some('-') {
+        return None;
+    }
+    let (p_year, p_month) = (&period[..4], &period[5..]);
+    if !p_year.chars().all(|c| c.is_ascii_digit()) || !p_month.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    // Validasi NSFP: angka minimal 10 digit (format Coretax 16-17 digit)
+    if nsfp.len() < 10 || !nsfp.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    // Nomor faktur & nama toko tidak boleh kosong
+    // Nomor faktur didukung alfanumerik (misal 3360234851 atau 336BA10045)
+    if buyer.is_empty() || invoice_no.is_empty() {
+        return None;
+    }
+
+    let buyer_clean = sanitize_filename_part(buyer);
+    let invoice_no_clean = sanitize_filename_part(invoice_no);
+    let period_clean = sanitize_filename_part(period);
+    let seller_clean = sanitize_filename_part(seller);
+    let nsfp_clean = sanitize_filename_part(nsfp);
+
+    Some(format!(
+        "{} - {} - {} - {} - {}{}",
+        buyer_clean, invoice_no_clean, period_clean, seller_clean, nsfp_clean, ext
+    ))
+}
+
 /// Langkah 2a — tukar blok ke-2 dan ke-3 dengan separator dash (A-B-C.ext -> A-C-B.ext)
 fn reorder_parts_dash(name: &str) -> Option<String> {
     let (stem, ext) = match name.rfind('.') {
         Some(i) => (&name[..i], &name[i..]),
         None => (name, ""),
     };
+
+    if stem.contains(" - ") {
+        return None;
+    }
 
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() < 3 {
@@ -122,6 +192,10 @@ fn reorder_parts_underscore(name: &str) -> Option<String> {
         None => (name, ""),
     };
 
+    if stem.contains(" _ ") {
+        return None;
+    }
+
     let parts: Vec<&str> = stem.split('_').collect();
     if parts.len() < 3 {
         return None;
@@ -136,6 +210,13 @@ fn reorder_parts_underscore(name: &str) -> Option<String> {
 
 /// Pipeline transformasi nama file
 fn transform(name: &str) -> Option<String> {
+    // Format Coretax: 5 blok dengan pemisah " - "
+    // Contoh: 2026-10 - 04002600451520535 - SEKAR NUSA BARUNA - INDOMARCO PRISMATAMA - 3360234851.pdf
+    // Hasil  : INDOMARCO PRISMATAMA - 3360234851 - 2026-10 - SEKAR NUSA BARUNA - 04002600451520535.pdf
+    if let Some(coretax) = transform_coretax_5parts(name) {
+        return Some(coretax);
+    }
+
     // Format 1: separator dash — OutputTaxInvoice-<UUID>-A-B-C.pdf
     if let Some(stripped) = strip_prefix_dash(name) {
         return Some(reorder_parts_dash(&stripped).unwrap_or(stripped));
@@ -214,4 +295,50 @@ fn main() {
         .invoke_handler(tauri::generate_handler![preview_invoices, process_invoices])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transform_coretax_numeric_invoice() {
+        let input = "2026-10 - 04002600451520535 - SEKAR NUSA BARUNA - INDOMARCO PRISMATAMA - 3360234851.pdf";
+        let expected = "INDOMARCO PRISMATAMA - 3360234851 - 2026-10 - SEKAR NUSA BARUNA - 04002600451520535.pdf";
+        assert_eq!(transform(input), Some(expected.to_string()));
+    }
+
+    #[test]
+    fn test_transform_coretax_alphanumeric_invoice() {
+        let input = "2026-10 - 04002600451520567 - SEKAR NUSA BARUNA - SENTRAL RETAILINDO DEWATA - 336BA10045.pdf";
+        let expected = "SENTRAL RETAILINDO DEWATA - 336BA10045 - 2026-10 - SEKAR NUSA BARUNA - 04002600451520567.pdf";
+        assert_eq!(transform(input), Some(expected.to_string()));
+    }
+
+    #[test]
+    fn test_transform_coretax_quotes_in_store_name() {
+        let input = "2026-10 - 04002600451520553 - SEKAR NUSA BARUNA - BOBY '76' - 3362082624.pdf";
+        let expected = "BOBY '76' - 3362082624 - 2026-10 - SEKAR NUSA BARUNA - 04002600451520553.pdf";
+        assert_eq!(transform(input), Some(expected.to_string()));
+    }
+
+    #[test]
+    fn test_transform_coretax_sanitization() {
+        let input = "2026-10 - 04002600451520553 - SEKAR NUSA BARUNA - TOKO \"BERKAH\" / AB - 3362082624.pdf";
+        let expected = "TOKO 'BERKAH' - AB - 3362082624 - 2026-10 - SEKAR NUSA BARUNA - 04002600451520553.pdf";
+        assert_eq!(transform(input), Some(expected.to_string()));
+    }
+
+    #[test]
+    fn test_transform_already_renamed_returns_none() {
+        let input = "INDOMARCO PRISMATAMA - 3360234851 - 2026-10 - SEKAR NUSA BARUNA - 04002600451520535.pdf";
+        assert_eq!(transform(input), None);
+    }
+
+    #[test]
+    fn test_transform_legacy_dash_uuid() {
+        let input = "OutputTaxInvoice-550e8400-e29b-41d4-a716-446655440000-010-002-24.pdf";
+        let expected = "010-24-002.pdf";
+        assert_eq!(transform(input), Some(expected.to_string()));
+    }
 }
